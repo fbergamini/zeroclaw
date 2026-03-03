@@ -438,6 +438,7 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
+        let already_on_cooldown = self.quota_reset_secs(model).is_some();
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -448,7 +449,7 @@ impl Provider for ReliableProvider {
         for current_model in &models {
             // Notify the channel layer when falling back to a lower-priority model
             // due to quota exhaustion, so the user sees an in-chat status message.
-            if *current_model != model {
+            if *current_model != model && !already_on_cooldown {
                 MODEL_SWITCH_NOTIFIER
                     .try_with(|tx| {
                         if let Some(tx) = tx.as_ref() {
@@ -559,7 +560,7 @@ impl Provider for ReliableProvider {
                 }
             }
 
-            if *current_model != model {
+            if *current_model != model && !already_on_cooldown {
                 tracing::warn!(
                     original_model = model,
                     fallback_model = *current_model,
@@ -580,11 +581,12 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
+        let already_on_cooldown = self.quota_reset_secs(model).is_some();
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
         for current_model in &models {
-            if *current_model != model {
+            if *current_model != model && !already_on_cooldown {
                 MODEL_SWITCH_NOTIFIER
                     .try_with(|tx| {
                         if let Some(tx) = tx.as_ref() {
@@ -722,11 +724,12 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
+        let already_on_cooldown = self.quota_reset_secs(model).is_some();
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
         for current_model in &models {
-            if *current_model != model {
+            if *current_model != model && !already_on_cooldown {
                 MODEL_SWITCH_NOTIFIER
                     .try_with(|tx| {
                         if let Some(tx) = tx.as_ref() {
@@ -848,11 +851,12 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
+        let already_on_cooldown = self.quota_reset_secs(model).is_some();
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
         for current_model in &models {
-            if *current_model != model {
+            if *current_model != model && !already_on_cooldown {
                 MODEL_SWITCH_NOTIFIER
                     .try_with(|tx| {
                         if let Some(tx) = tx.as_ref() {
@@ -962,7 +966,7 @@ impl Provider for ReliableProvider {
                 }
             }
 
-            if *current_model != model {
+            if *current_model != model && !already_on_cooldown {
                 tracing::warn!(
                     original_model = model,
                     fallback_model = *current_model,
