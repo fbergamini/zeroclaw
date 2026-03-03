@@ -42,6 +42,7 @@ pub use traits::{
     Provider, ProviderCapabilityError, ToolCall, ToolResultMessage, ROLE_ASSISTANT, ROLE_SYSTEM,
     ROLE_TOOL, ROLE_USER,
 };
+pub use reliable::MODEL_SWITCH_NOTIFIER;
 
 use crate::auth::AuthService;
 use crate::plugins;

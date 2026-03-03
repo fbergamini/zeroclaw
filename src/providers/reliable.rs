@@ -8,6 +8,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+// ── Model-switch notification task-local ─────────────────────────────────────
+// Set by the channel dispatch layer before the agent tool loop so that
+// ReliableProvider can fire an in-chat notice whenever it falls back from the
+// primary model to a quota-limited alternative.
+tokio::task_local! {
+    pub static MODEL_SWITCH_NOTIFIER:
+        Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>;
+}
+
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
 // non-retryable (permanent client errors). This distinction drives whether
@@ -383,6 +392,18 @@ impl Provider for ReliableProvider {
         // immediately. On non-retryable error, break to next provider. On
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
+            // Notify the channel layer when falling back to a lower-priority model
+            // due to quota exhaustion, so the user sees an in-chat status message.
+            if *current_model != model {
+                MODEL_SWITCH_NOTIFIER
+                    .try_with(|tx| {
+                        if let Some(tx) = tx.as_ref() {
+                            let _ = tx
+                                .send((model.to_string(), (*current_model).to_string()));
+                        }
+                    })
+                    .ok();
+            }
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
@@ -508,6 +529,16 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
 
         for current_model in &models {
+            if *current_model != model {
+                MODEL_SWITCH_NOTIFIER
+                    .try_with(|tx| {
+                        if let Some(tx) = tx.as_ref() {
+                            let _ = tx
+                                .send((model.to_string(), (*current_model).to_string()));
+                        }
+                    })
+                    .ok();
+            }
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
@@ -639,6 +670,16 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
 
         for current_model in &models {
+            if *current_model != model {
+                MODEL_SWITCH_NOTIFIER
+                    .try_with(|tx| {
+                        if let Some(tx) = tx.as_ref() {
+                            let _ = tx
+                                .send((model.to_string(), (*current_model).to_string()));
+                        }
+                    })
+                    .ok();
+            }
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
@@ -754,6 +795,16 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
 
         for current_model in &models {
+            if *current_model != model {
+                MODEL_SWITCH_NOTIFIER
+                    .try_with(|tx| {
+                        if let Some(tx) = tx.as_ref() {
+                            let _ = tx
+                                .send((model.to_string(), (*current_model).to_string()));
+                        }
+                    })
+                    .ok();
+            }
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);

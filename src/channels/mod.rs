@@ -3874,38 +3874,72 @@ or tune thresholds in config.",
             None
         };
 
-    let llm_result = tokio::select! {
-        () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-        result = tokio::time::timeout(
-            Duration::from_secs(timeout_budget_secs),
-            crate::tools::MEMORY_SESSION_HINT.scope(
-                memory_session_hint,
-                crate::agent::loop_::scope_cost_enforcement_context(
-                    cost_enforcement_context,
-                    run_tool_call_loop_with_non_cli_approval_context(
-                    active_provider.as_ref(),
-                    &mut history,
-                    ctx.tools_registry.as_ref(),
-                    ctx.observer.as_ref(),
-                    route.provider.as_str(),
-                    route.model.as_str(),
-                    runtime_defaults.temperature,
-                    true,
-                    Some(ctx.approval_manager.as_ref()),
-                    msg.channel.as_str(),
-                    non_cli_approval_context,
-                    &runtime_defaults.multimodal,
-                    runtime_defaults.max_tool_iterations,
-                    Some(cancellation_token.clone()),
-                    delta_tx,
-                    ctx.hooks.as_deref(),
-                    &excluded_tools_snapshot,
-                    progress_mode,
-                    ctx.safety_heartbeat.clone(),
-                ),
-            ),
-            ),
-        ) => LlmExecutionResult::Completed(result),
+    let llm_result = {
+        // When ReliableProvider falls back to a lower-priority model due to quota
+        // exhaustion, notify the active chat so the user knows which model is now
+        // handling the request.
+        let model_switch_notifier =
+            if let Some(channel) = target_channel.as_ref() {
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+                let ch = channel.clone();
+                let reply_tgt = msg.reply_target.clone();
+                let thread_ts_clone = msg.thread_ts.clone();
+                tokio::spawn(async move {
+                    while let Some((original, fallback)) = rx.recv().await {
+                        let notice = format!(
+                            "⚡ Quota limit reached for `{original}`, switching to `{fallback}`."
+                        );
+                        let _ = ch
+                            .send(
+                                &SendMessage::new(notice, &reply_tgt)
+                                    .in_thread(thread_ts_clone.clone()),
+                            )
+                            .await;
+                    }
+                });
+                Some(tx)
+            } else {
+                None
+            };
+
+        crate::providers::MODEL_SWITCH_NOTIFIER
+            .scope(model_switch_notifier, async {
+                tokio::select! {
+                    () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+                    result = tokio::time::timeout(
+                        Duration::from_secs(timeout_budget_secs),
+                        crate::tools::MEMORY_SESSION_HINT.scope(
+                            memory_session_hint,
+                            crate::agent::loop_::scope_cost_enforcement_context(
+                                cost_enforcement_context,
+                                run_tool_call_loop_with_non_cli_approval_context(
+                                active_provider.as_ref(),
+                                &mut history,
+                                ctx.tools_registry.as_ref(),
+                                ctx.observer.as_ref(),
+                                route.provider.as_str(),
+                                route.model.as_str(),
+                                runtime_defaults.temperature,
+                                true,
+                                Some(ctx.approval_manager.as_ref()),
+                                msg.channel.as_str(),
+                                non_cli_approval_context,
+                                &runtime_defaults.multimodal,
+                                runtime_defaults.max_tool_iterations,
+                                Some(cancellation_token.clone()),
+                                delta_tx,
+                                ctx.hooks.as_deref(),
+                                &excluded_tools_snapshot,
+                                progress_mode,
+                                ctx.safety_heartbeat.clone(),
+                            ),
+                        ),
+                        ),
+                    ) => LlmExecutionResult::Completed(result),
+                }
+            })
+            .await
     };
 
     if let Some(handle) = draft_updater {
