@@ -1236,6 +1236,7 @@ mod tests {
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["*".into()],
+per_conversation_workspace: false,
         });
 
         let mut job = test_job("echo ok");

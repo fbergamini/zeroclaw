@@ -4993,6 +4993,18 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+    /// Give each conversation (DM or group) its own workspace directory.
+    ///
+    /// When enabled, the first message in a new conversation bootstraps a
+    /// dedicated workspace at `<workspace>/conversations/whatsapp/<jid>/`
+    /// by copying the global `BOOTSTRAP.md` into it (with context about
+    /// the conversation).  Subsequent messages load OpenClaw files
+    /// (AGENTS.md, SOUL.md, …) from that conversation workspace instead
+    /// of from the main workspace.
+    ///
+    /// Default: false (all conversations share the main workspace).
+    #[serde(default)]
+    pub per_conversation_workspace: bool,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -10974,6 +10986,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
+per_conversation_workspace: false,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -10994,6 +11007,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+per_conversation_workspace: false,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -11019,6 +11033,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["*".into()],
+per_conversation_workspace: false,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -11036,6 +11051,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+per_conversation_workspace: false,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -11052,6 +11068,7 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec![],
+per_conversation_workspace: false,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -11079,6 +11096,7 @@ channel_id = "C123"
                 pair_phone: None,
                 pair_code: None,
                 allowed_numbers: vec!["+1".into()],
+per_conversation_workspace: false,
             }),
             linq: None,
             github: None,
