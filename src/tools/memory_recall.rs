@@ -37,6 +37,10 @@ impl Tool for MemoryRecallTool {
                 "limit": {
                     "type": "integer",
                     "description": "Max results to return (default: 5)"
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Scope recall to a specific conversation. In per-conversation workspaces always pass the reply_target value provided in your context."
                 }
             },
             "required": ["query"]
@@ -55,7 +59,20 @@ impl Tool for MemoryRecallTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(5, |v| v as usize);
 
-        match self.memory.recall(query, limit, None).await {
+        let session_id_owned: Option<String> = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                crate::tools::MEMORY_SESSION_HINT
+                    .try_with(|h| h.clone())
+                    .ok()
+                    .flatten()
+            });
+        let session_id: Option<&str> = session_id_owned.as_deref();
+
+        match self.memory.recall(query, limit, session_id).await {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
                 success: true,
                 output: "No memories found matching that query.".into(),

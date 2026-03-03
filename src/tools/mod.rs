@@ -154,6 +154,14 @@ pub use xlsx_read::XlsxReadTool;
 pub use auth_profile::ManageAuthProfileTool;
 pub use quota_tools::{CheckProviderQuotaTool, EstimateQuotaCostTool, SwitchProviderTool};
 
+/// Task-local session-id hint injected by the channel dispatch layer whenever a
+/// per-conversation workspace channel is active.  Memory tools read this as the
+/// default `session_id` when the LLM does not supply one explicitly, ensuring
+/// isolation even when the model forgets to pass the parameter.
+tokio::task_local! {
+    pub(crate) static MEMORY_SESSION_HINT: Option<String>;
+}
+
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::plugins;

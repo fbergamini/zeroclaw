@@ -58,6 +58,10 @@ impl Tool for MemoryObserveTool {
                 "category": {
                     "type": "string",
                     "description": "Optional category override. Defaults to 'observation'."
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "Scope this observation to a specific conversation. In per-conversation workspaces always pass the reply_target value provided in your context."
                 }
             },
             "required": ["observation"]
@@ -131,7 +135,20 @@ impl Tool for MemoryObserveTool {
             });
         }
 
-        match self.memory.store(&key, &content, category, None).await {
+        let session_id_owned: Option<String> = args
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                crate::tools::MEMORY_SESSION_HINT
+                    .try_with(|h| h.clone())
+                    .ok()
+                    .flatten()
+            });
+        let session_id: Option<&str> = session_id_owned.as_deref();
+
+        match self.memory.store(&key, &content, category, session_id).await {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!("Stored observation memory: {key}"),

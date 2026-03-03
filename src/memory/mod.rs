@@ -438,6 +438,86 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
     }
 }
 
+/// A `Memory` wrapper that forces all reads and writes to use a fixed
+/// `session_id`.  Used for per-conversation memory isolation: each WhatsApp
+/// chat (or group) gets its own `ScopedMemory` backed by the global store, so
+/// `memory_store` / `memory_recall` tool calls are automatically namespaced to
+/// the current conversation even when the agent doesn't explicitly pass a scope.
+pub struct ScopedMemory {
+    inner: Arc<dyn Memory>,
+    session_id: String,
+}
+
+impl ScopedMemory {
+    pub fn new(inner: Arc<dyn Memory>, session_id: impl Into<String>) -> Self {
+        Self {
+            inner,
+            session_id: session_id.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Memory for ScopedMemory {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn store(
+        &self,
+        key: &str,
+        content: &str,
+        category: crate::memory::traits::MemoryCategory,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .store(key, content, category, Some(&self.session_id))
+            .await
+    }
+
+    async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::memory::traits::MemoryEntry>> {
+        self.inner
+            .recall(query, limit, Some(&self.session_id))
+            .await
+    }
+
+    async fn get(&self, key: &str) -> anyhow::Result<Option<crate::memory::traits::MemoryEntry>> {
+        self.inner.get(key).await
+    }
+
+    async fn list(
+        &self,
+        category: Option<&crate::memory::traits::MemoryCategory>,
+        _session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<crate::memory::traits::MemoryEntry>> {
+        self.inner.list(category, Some(&self.session_id)).await
+    }
+
+    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+        self.inner.forget(key).await
+    }
+
+    async fn count(&self) -> anyhow::Result<usize> {
+        self.inner.count().await
+    }
+
+    async fn health_check(&self) -> bool {
+        self.inner.health_check().await
+    }
+
+    async fn reindex(
+        &self,
+        progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+    ) -> anyhow::Result<usize> {
+        self.inner.reindex(progress_callback).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
