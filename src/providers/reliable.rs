@@ -6,7 +6,8 @@ use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ── Model-switch notification task-local ─────────────────────────────────────
 // Set by the channel dispatch layer before the agent tool loop so that
@@ -14,7 +15,7 @@ use std::time::Duration;
 // primary model to a quota-limited alternative.
 tokio::task_local! {
     pub static MODEL_SWITCH_NOTIFIER:
-        Option<tokio::sync::mpsc::UnboundedSender<(String, String)>>;
+        Option<tokio::sync::mpsc::UnboundedSender<(String, String, Option<u64>)>>;
 }
 
 // ── Error Classification ─────────────────────────────────────────────────
@@ -251,6 +252,10 @@ pub struct ReliableProvider {
     provider_model_fallbacks: HashMap<String, Vec<String>>,
     /// Vision support override from config (`None` = defer to provider).
     vision_override: Option<bool>,
+    /// Tracks models with exhausted quota: model → (expires_at, retry_after_secs).
+    /// model_chain skips entries whose expires_at is still in the future, letting
+    /// the next (cheaper) model handle the request until quota refreshes.
+    quota_cooldowns: Arc<Mutex<HashMap<String, (Instant, u64)>>>,
 }
 
 impl ReliableProvider {
@@ -268,6 +273,7 @@ impl ReliableProvider {
             model_fallbacks: HashMap::new(),
             provider_model_fallbacks: HashMap::new(),
             vision_override: None,
+            quota_cooldowns: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -305,12 +311,60 @@ impl ReliableProvider {
     }
 
     /// Build the list of models to try: [original, fallback1, fallback2, ...]
+    /// Models with an active quota cooldown are skipped unless they are the only
+    /// option (so we never return an empty chain).
     fn model_chain<'a>(&'a self, model: &'a str) -> Vec<&'a str> {
         let mut chain = vec![model];
         if let Some(fallbacks) = self.model_fallbacks.get(model) {
             chain.extend(fallbacks.iter().map(|s| s.as_str()));
         }
+        // Filter out models still in quota cooldown, keeping at least one.
+        if let Ok(cd) = self.quota_cooldowns.lock() {
+            let now = Instant::now();
+            let filtered: Vec<&str> = chain
+                .iter()
+                .copied()
+                .filter(|m| cd.get(*m).map_or(true, |(exp, _)| now >= *exp))
+                .collect();
+            if !filtered.is_empty() {
+                return filtered;
+            }
+        }
         chain
+    }
+
+    /// If `err` is a non-retryable quota exhaustion, record a cooldown for
+    /// `model` so that `model_chain` skips it until the quota window expires.
+    /// Returns the retry_after_secs that was recorded, or None if not applicable.
+    fn maybe_record_quota_cooldown(&self, model: &str, err: &anyhow::Error) -> Option<u64> {
+        if !is_non_retryable_rate_limit(err) {
+            return None;
+        }
+        let retry_secs = parse_retry_after_ms(err)
+            .map(|ms| ms.saturating_add(999) / 1000)
+            .unwrap_or(3600);
+        let expires_at = Instant::now() + Duration::from_secs(retry_secs);
+        if let Ok(mut cd) = self.quota_cooldowns.lock() {
+            // Only insert (or extend) — never shorten an existing cooldown.
+            let entry = cd.entry(model.to_string()).or_insert((expires_at, retry_secs));
+            if expires_at > entry.0 {
+                *entry = (expires_at, retry_secs);
+            }
+        }
+        Some(retry_secs)
+    }
+
+    /// Return the seconds remaining until `model`'s quota cooldown expires,
+    /// or None if the model has no active cooldown.
+    fn quota_reset_secs(&self, model: &str) -> Option<u64> {
+        let cd = self.quota_cooldowns.lock().ok()?;
+        let (expires_at, _) = cd.get(model)?;
+        let now = Instant::now();
+        if now >= *expires_at {
+            None
+        } else {
+            Some(expires_at.duration_since(now).as_secs().max(1))
+        }
     }
 
     /// Build provider-specific model candidates for this request.
@@ -399,7 +453,7 @@ impl Provider for ReliableProvider {
                     .try_with(|tx| {
                         if let Some(tx) = tx.as_ref() {
                             let _ = tx
-                                .send((model.to_string(), (*current_model).to_string()));
+                                .send((model.to_string(), (*current_model).to_string(), self.quota_reset_secs(model)));
                         }
                     })
                     .ok();
@@ -475,6 +529,7 @@ impl Provider for ReliableProvider {
                                         );
                                     }
 
+                                    self.maybe_record_quota_cooldown(current_model, &e);
                                     break;
                                 }
 
@@ -534,7 +589,7 @@ impl Provider for ReliableProvider {
                     .try_with(|tx| {
                         if let Some(tx) = tx.as_ref() {
                             let _ = tx
-                                .send((model.to_string(), (*current_model).to_string()));
+                                .send((model.to_string(), (*current_model).to_string(), self.quota_reset_secs(model)));
                         }
                     })
                     .ok();
@@ -608,6 +663,7 @@ impl Provider for ReliableProvider {
                                         );
                                     }
 
+                                    self.maybe_record_quota_cooldown(current_model, &e);
                                     break;
                                 }
 
@@ -675,7 +731,7 @@ impl Provider for ReliableProvider {
                     .try_with(|tx| {
                         if let Some(tx) = tx.as_ref() {
                             let _ = tx
-                                .send((model.to_string(), (*current_model).to_string()));
+                                .send((model.to_string(), (*current_model).to_string(), self.quota_reset_secs(model)));
                         }
                     })
                     .ok();
@@ -749,6 +805,7 @@ impl Provider for ReliableProvider {
                                         );
                                     }
 
+                                    self.maybe_record_quota_cooldown(current_model, &e);
                                     break;
                                 }
 
@@ -800,7 +857,7 @@ impl Provider for ReliableProvider {
                     .try_with(|tx| {
                         if let Some(tx) = tx.as_ref() {
                             let _ = tx
-                                .send((model.to_string(), (*current_model).to_string()));
+                                .send((model.to_string(), (*current_model).to_string(), self.quota_reset_secs(model)));
                         }
                     })
                     .ok();
@@ -875,6 +932,7 @@ impl Provider for ReliableProvider {
                                         );
                                     }
 
+                                    self.maybe_record_quota_cooldown(current_model, &e);
                                     break;
                                 }
 

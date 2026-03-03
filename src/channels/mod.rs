@@ -3881,14 +3881,32 @@ or tune thresholds in config.",
         let model_switch_notifier =
             if let Some(channel) = target_channel.as_ref() {
                 let (tx, mut rx) =
-                    tokio::sync::mpsc::unbounded_channel::<(String, String)>();
+                    tokio::sync::mpsc::unbounded_channel::<(String, String, Option<u64>)>();
                 let ch = channel.clone();
                 let reply_tgt = msg.reply_target.clone();
                 let thread_ts_clone = msg.thread_ts.clone();
                 tokio::spawn(async move {
-                    while let Some((original, fallback)) = rx.recv().await {
+                    while let Some((original, fallback, reset_secs)) = rx.recv().await {
+                        // Format how long until the primary quota refreshes.
+                        let eta = match reset_secs {
+                            Some(s) if s >= 3600 => {
+                                let h = s / 3600;
+                                let m = (s % 3600) / 60;
+                                if m > 0 {
+                                    format!(" Quota refreshes in ~{h}h {m}min.")
+                                } else {
+                                    format!(" Quota refreshes in ~{h}h.")
+                                }
+                            }
+                            Some(s) if s >= 60 => {
+                                let m = s / 60;
+                                format!(" Quota refreshes in ~{m} min.")
+                            }
+                            Some(s) => format!(" Quota refreshes in ~{s}s."),
+                            None => String::new(),
+                        };
                         let notice = format!(
-                            "⚡ Quota limit reached for `{original}`, switching to `{fallback}`."
+                            "⚡ Quota limit reached for `{original}`, switching to `{fallback}`.{eta}"
                         );
                         let _ = ch
                             .send(
@@ -3896,6 +3914,27 @@ or tune thresholds in config.",
                                     .in_thread(thread_ts_clone.clone()),
                             )
                             .await;
+                        // Spawn a wakeup task: when quota refreshes, notify the
+                        // chat and the next request will automatically try the
+                        // better model again (cooldown is Instant-based).
+                        if let Some(secs) = reset_secs {
+                            let ch2 = ch.clone();
+                            let reply_tgt2 = reply_tgt.clone();
+                            let thread_ts2 = thread_ts_clone.clone();
+                            let original2 = original.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_secs(secs)).await;
+                                let back_notice = format!(
+                                    "✅ Quota refreshed — switching back to `{original2}`."
+                                );
+                                let _ = ch2
+                                    .send(
+                                        &SendMessage::new(back_notice, &reply_tgt2)
+                                            .in_thread(thread_ts2),
+                                    )
+                                    .await;
+                            });
+                        }
                     }
                 });
                 Some(tx)
