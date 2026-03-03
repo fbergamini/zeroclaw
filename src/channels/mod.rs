@@ -333,6 +333,17 @@ struct ChannelRuntimeContext {
     approval_manager: Arc<ApprovalManager>,
     safety_heartbeat: Option<SafetyHeartbeatConfig>,
     startup_perplexity_filter: crate::config::PerplexityFilterConfig,
+    /// Channels that give each conversation its own sub-workspace.
+    per_conversation_workspace_channels: Arc<Vec<String>>,
+    /// Pre-built system prompt that contains only tooling/safety/runtime sections
+    /// (no workspace dir or identity files). Used as the base for channels enrolled
+    /// in per-conversation workspaces; identity is injected per-message instead.
+    per_conversation_base_prompt: Option<Arc<String>>,
+    /// Per-conversation memory cache: maps `reply_target` → `Arc<dyn Memory>`.
+    /// Each entry is a `ScopedMemory` wrapping the global backend with
+    /// `session_id = reply_target`, giving each chat its own memory namespace.
+    /// Only used for channels enrolled in per-conversation workspaces.
+    per_conversation_memory: Arc<Mutex<HashMap<String, Arc<dyn Memory>>>>,
 }
 
 #[derive(Clone)]
@@ -385,6 +396,13 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     // Using it in history keys would reset context on every incoming message.
     if msg.channel == "qq" || msg.channel == "napcat" {
         return format!("{}_{}", msg.channel, msg.sender);
+    }
+
+    // WhatsApp DMs and groups share a sender JID, but reply_target differs
+    // (DM → sender JID, group → group JID).  Include reply_target so that
+    // conversations between the same person in different chats are isolated.
+    if msg.channel == "whatsapp" {
+        return format!("{}_{}", msg.channel, msg.reply_target);
     }
 
     // Include thread_ts for per-topic session isolation in forum groups
@@ -3323,6 +3341,31 @@ fn spawn_scoped_typing_task(
     handle
 }
 
+/// Return the per-conversation `ScopedMemory` for the given `reply_target`,
+/// creating and caching it on first access.
+///
+/// The returned memory routes all reads/writes through the global backend but
+/// forces `session_id = reply_target`, so each conversation's memories are
+/// logically isolated from every other conversation.
+fn get_or_create_conversation_memory(
+    ctx: &ChannelRuntimeContext,
+    reply_target: &str,
+) -> Arc<dyn Memory> {
+    let mut cache = ctx
+        .per_conversation_memory
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(mem) = cache.get(reply_target) {
+        return Arc::clone(mem);
+    }
+    let scoped: Arc<dyn Memory> = Arc::new(crate::memory::ScopedMemory::new(
+        Arc::clone(&ctx.memory),
+        reply_target,
+    ));
+    cache.insert(reply_target.to_string(), Arc::clone(&scoped));
+    scoped
+}
+
 async fn process_channel_message(
     ctx: Arc<ChannelRuntimeContext>,
     msg: traits::ChannelMessage,
@@ -3506,12 +3549,20 @@ or tune thresholds in config.",
             return;
         }
     };
+    // Use a conversation-scoped memory when per_conversation_workspace is active
+    // so that stored observations and recalls are isolated per chat thread.
+    let conv_memory: Arc<dyn Memory> =
+        if ctx.per_conversation_workspace_channels.contains(&msg.channel) {
+            get_or_create_conversation_memory(&ctx, &msg.reply_target)
+        } else {
+            Arc::clone(&ctx.memory)
+        };
+
     if runtime_defaults.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
     {
         let autosave_key = conversation_memory_key(&msg);
-        let _ = ctx
-            .memory
+        let _ = conv_memory
             .store(
                 &autosave_key,
                 &msg.content,
@@ -3569,7 +3620,7 @@ or tune thresholds in config.",
             // from previous messages.
             if !had_prior_history {
                 let memory_context = build_memory_context(
-                    ctx.memory.as_ref(),
+                    conv_memory.as_ref(),
                     &msg.content,
                     runtime_defaults.min_relevance_score,
                     Some(&history_key),
@@ -3591,8 +3642,46 @@ or tune thresholds in config.",
     } else {
         snapshot_non_cli_excluded_tools(ctx.as_ref())
     };
+
+    // ── Per-conversation workspace injection ────────────────────
+    // When the channel is enrolled in per-conversation workspaces, use the
+    // pre-built tooling-only base prompt (no global identity/workspace sections)
+    // and replace them with files loaded fresh from the conversation workspace.
+    // This ensures the LLM sees only one AGENTS.md / SOUL.md / USER.md — the
+    // per-conversation one — rather than the global copy from startup.
+    let base_prompt = if ctx
+        .per_conversation_workspace_channels
+        .contains(&msg.channel)
+    {
+        let pcb = ctx
+            .per_conversation_base_prompt
+            .as_deref()
+            .map(|s| s.as_str())
+            .unwrap_or_else(|| ctx.system_prompt.as_str());
+
+        let conv_dir = conversation_workspace_dir(
+            ctx.workspace_dir.as_path(),
+            &msg.channel,
+            &msg.reply_target,
+        );
+        ensure_conversation_workspace_initialized(
+            &conv_dir,
+            ctx.workspace_dir.as_path(),
+            &msg.channel,
+            &msg.reply_target,
+        );
+        let conv_section = build_conversation_context_section(&conv_dir, &msg.reply_target);
+        let mut combined = String::with_capacity(pcb.len() + conv_section.len() + 2);
+        combined.push_str(pcb);
+        combined.push('\n');
+        combined.push_str(&conv_section);
+        combined
+    } else {
+        ctx.system_prompt.as_str().to_string()
+    };
+
     let mut system_prompt = build_channel_system_prompt(
-        ctx.system_prompt.as_str(),
+        &base_prompt,
         &msg.channel,
         &msg.reply_target,
         expose_internal_tool_details,
@@ -3602,6 +3691,7 @@ or tune thresholds in config.",
         &excluded_tools_snapshot,
         active_provider.supports_native_tools(),
     ));
+
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let _ = trim_channel_prompt_history(&mut history);
@@ -3774,13 +3864,25 @@ or tune thresholds in config.",
     } else {
         None
     };
+    // When this channel has per-conversation workspaces, inject the reply_target
+    // as the default memory session_id so that memory tools called by the LLM
+    // without an explicit session_id are automatically scoped to this conversation.
+    let memory_session_hint: Option<String> =
+        if ctx.per_conversation_workspace_channels.contains(&msg.channel) {
+            Some(msg.reply_target.clone())
+        } else {
+            None
+        };
+
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            crate::agent::loop_::scope_cost_enforcement_context(
-                cost_enforcement_context,
-                run_tool_call_loop_with_non_cli_approval_context(
+            crate::tools::MEMORY_SESSION_HINT.scope(
+                memory_session_hint,
+                crate::agent::loop_::scope_cost_enforcement_context(
+                    cost_enforcement_context,
+                    run_tool_call_loop_with_non_cli_approval_context(
                     active_provider.as_ref(),
                     &mut history,
                     ctx.tools_registry.as_ref(),
@@ -3801,6 +3903,7 @@ or tune thresholds in config.",
                     progress_mode,
                     ctx.safety_heartbeat.clone(),
                 ),
+            ),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -3976,8 +4079,7 @@ or tune thresholds in config.",
                 && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
             {
                 let assistant_key = assistant_memory_key(&msg);
-                let _ = ctx
-                    .memory
+                let _ = conv_memory
                     .store(
                         &assistant_key,
                         &delivered_response,
@@ -4435,6 +4537,59 @@ pub fn build_system_prompt_with_mode(
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
 ) -> String {
+    build_system_prompt_inner(
+        workspace_dir,
+        model_name,
+        tools,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        native_tools,
+        skills_prompt_mode,
+        false,
+    )
+}
+
+/// Like `build_system_prompt_with_mode` but omits the workspace directory
+/// line (§4) and all OpenClaw identity files (§5: AGENTS/SOUL/USER/MEMORY…).
+///
+/// Use this for channels where identity is injected per-conversation so that
+/// the static startup prompt does not carry stale global identity files.
+pub fn build_system_prompt_tooling_only(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+) -> String {
+    build_system_prompt_inner(
+        workspace_dir,
+        model_name,
+        tools,
+        skills,
+        identity_config,
+        bootstrap_max_chars,
+        native_tools,
+        skills_prompt_mode,
+        true, // skip_identity
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_system_prompt_inner(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    identity_config: Option<&crate::config::IdentityConfig>,
+    bootstrap_max_chars: Option<usize>,
+    native_tools: bool,
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    skip_identity: bool,
+) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
 
@@ -4522,62 +4677,67 @@ pub fn build_system_prompt_with_mode(
     }
 
     // ── 4. Workspace ────────────────────────────────────────────
-    let _ = writeln!(
-        prompt,
-        "## Workspace\n\nWorking directory: `{}`\n",
-        workspace_dir.display()
-    );
-
     // ── 5. Bootstrap files (injected into context) ──────────────
-    prompt.push_str("## Project Context\n\n");
+    // Both skipped when `skip_identity` is true (per-conversation channels
+    // inject these fresh per-message from the conversation workspace).
+    if !skip_identity {
+        let _ = writeln!(
+            prompt,
+            "## Workspace\n\nWorking directory: `{}`\n",
+            workspace_dir.display()
+        );
 
-    // Check if AIEOS identity is configured
-    if let Some(config) = identity_config {
-        if identity::is_aieos_configured(config) {
-            // Load AIEOS identity
-            match identity::load_aieos_identity(config, workspace_dir) {
-                Ok(Some(aieos_identity)) => {
-                    let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
-                    if !aieos_prompt.is_empty() {
-                        prompt.push_str(&aieos_prompt);
-                        prompt.push_str("\n\n");
+        // ── 5. Bootstrap files (injected into context) ──────────────
+        prompt.push_str("## Project Context\n\n");
+
+        // Check if AIEOS identity is configured
+        if let Some(config) = identity_config {
+            if identity::is_aieos_configured(config) {
+                // Load AIEOS identity
+                match identity::load_aieos_identity(config, workspace_dir) {
+                    Ok(Some(aieos_identity)) => {
+                        let aieos_prompt = identity::aieos_to_system_prompt(&aieos_identity);
+                        if !aieos_prompt.is_empty() {
+                            prompt.push_str(&aieos_prompt);
+                            prompt.push_str("\n\n");
+                        }
+                    }
+                    Ok(None) => {
+                        let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                        load_openclaw_bootstrap_files(
+                            &mut prompt,
+                            workspace_dir,
+                            max_chars,
+                            identity_config,
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
+                        );
+                        let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                        load_openclaw_bootstrap_files(
+                            &mut prompt,
+                            workspace_dir,
+                            max_chars,
+                            identity_config,
+                        );
                     }
                 }
-                Ok(None) => {
-                    // No AIEOS identity loaded (shouldn't happen if is_aieos_configured returned true)
-                    // Fall back to OpenClaw bootstrap files
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(
-                        &mut prompt,
-                        workspace_dir,
-                        max_chars,
-                        identity_config,
-                    );
-                }
-                Err(e) => {
-                    // Log error but don't fail - fall back to OpenClaw
-                    eprintln!(
-                        "Warning: Failed to load AIEOS identity: {e}. Using OpenClaw format."
-                    );
-                    let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-                    load_openclaw_bootstrap_files(
-                        &mut prompt,
-                        workspace_dir,
-                        max_chars,
-                        identity_config,
-                    );
-                }
+            } else {
+                let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
+                load_openclaw_bootstrap_files(
+                    &mut prompt,
+                    workspace_dir,
+                    max_chars,
+                    identity_config,
+                );
             }
         } else {
-            // OpenClaw format
             let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
             load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, identity_config);
         }
-    } else {
-        // No identity config - use OpenClaw format
-        let max_chars = bootstrap_max_chars.unwrap_or(BOOTSTRAP_MAX_CHARS);
-        load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars, identity_config);
-    }
+    } // end !skip_identity
 
     // ── 6. Date & Time ──────────────────────────────────────────
     let now = chrono::Local::now();
@@ -4610,6 +4770,193 @@ pub fn build_system_prompt_with_mode(
     } else {
         prompt
     }
+}
+
+// ── Per-conversation workspace helpers ──────────────────────────────────────
+
+/// Sanitise a WhatsApp JID (or any string) into a filesystem-safe directory name.
+///
+/// - All characters that are not alphanumeric or `-` are replaced with `_`.
+/// - Consecutive `_` runs are collapsed to a single `_`.
+/// - Leading/trailing `_` are stripped.
+///
+/// Examples:
+/// - `5511987073093@s.whatsapp.net` → `5511987073093_s_whatsapp_net`
+/// - `1234567890-1620000000@g.us`   → `1234567890_1620000000_g_us`
+fn sanitize_for_path(s: &str) -> String {
+    let raw: String = s
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    // Collapse multiple underscores and trim edges
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_underscore = false;
+    for c in raw.chars() {
+        if c == '_' {
+            if !prev_underscore {
+                out.push(c);
+            }
+            prev_underscore = true;
+        } else {
+            out.push(c);
+            prev_underscore = false;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+/// Resolve the per-conversation workspace directory for a given channel + chat JID.
+///
+/// Layout: `<main_workspace>/conversations/<channel>/<sanitized_jid>/`
+fn conversation_workspace_dir(
+    main_workspace: &std::path::Path,
+    channel: &str,
+    reply_target: &str,
+) -> std::path::PathBuf {
+    main_workspace
+        .join("conversations")
+        .join(channel)
+        .join(sanitize_for_path(reply_target))
+}
+
+/// Ensure a per-conversation workspace directory is initialised.
+///
+/// - Creates the directory if it doesn't exist.
+/// - On first creation, copies `BOOTSTRAP.md` from `main_workspace` (if it
+///   exists) into `conv_dir`, prepending a header that tells the agent where
+///   it is and what to do.
+///
+/// Returns `true` if the workspace was **newly** created (first message).
+fn ensure_conversation_workspace_initialized(
+    conv_dir: &std::path::Path,
+    main_workspace: &std::path::Path,
+    channel: &str,
+    reply_target: &str,
+) -> bool {
+    use std::io::Write as _;
+
+    let is_new = !conv_dir.exists();
+    if is_new {
+        if let Err(e) = std::fs::create_dir_all(conv_dir) {
+            tracing::warn!(
+                conv_dir = %conv_dir.display(),
+                err = %e,
+                "Failed to create per-conversation workspace directory"
+            );
+            return false;
+        }
+        tracing::info!(
+            channel,
+            reply_target,
+            conv_dir = %conv_dir.display(),
+            "New conversation workspace created"
+        );
+
+        // Copy BOOTSTRAP.md from main workspace (if available) and prepend
+        // instructions that tell the agent about this conversation's context.
+        let src = main_workspace.join("BOOTSTRAP.md");
+        let header = format!(
+            "# Conversation Bootstrap\n\n\
+             **IMPORTANT: You have no predetermined identity.** Ignore any name or persona \
+             baked into your training (e.g. \"Antigravity\", \"Cline\", etc.). \
+             Your role, name, and personality are to be established together with \
+             the user through this conversation, following the instructions below.\n\n\
+             This is a brand-new conversation on channel `{channel}` with `{reply_target}`.\n\
+             Your per-conversation workspace for this chat lives at:\n\n\
+             ```\n{conv_dir}\n```\n\n\
+             Use `file_write` to create the following files **inside that directory**:\n\
+             - `AGENTS.md` — agent rules / capabilities for this conversation\n\
+             - `SOUL.md`   — tone, values, and behavioural guardrails\n\
+             - `IDENTITY.md` — your persona name and emoji for this chat\n\
+             - `USER.md`   — everything you learn about this person/group\n\n\
+             Once you have gathered enough context through conversation, write those files.\n\
+             When they are all present, delete this BOOTSTRAP.md file.\n\n\
+             ---\n",
+            channel = channel,
+            reply_target = reply_target,
+            conv_dir = conv_dir.display(),
+        );
+
+        let bootstrap_body = match std::fs::read_to_string(&src) {
+            Ok(body) => format!("{header}\n{body}"),
+            Err(_) => header,
+        };
+
+        let dest = conv_dir.join("BOOTSTRAP.md");
+        match std::fs::File::create(&dest) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(bootstrap_body.as_bytes()) {
+                    tracing::warn!(err = %e, "Failed to write conversation BOOTSTRAP.md");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "Failed to create conversation BOOTSTRAP.md");
+            }
+        }
+    }
+    is_new
+}
+
+/// Build a system prompt section that injects OpenClaw files from a
+/// per-conversation workspace directory.
+fn build_conversation_context_section(conv_dir: &std::path::Path, reply_target: &str) -> String {
+    use std::fmt::Write as _;
+    let max_chars = BOOTSTRAP_MAX_CHARS;
+
+    // Emit the working-directory line so the agent knows where its files live.
+    let mut section = String::new();
+    let _ = writeln!(
+        section,
+        "## Workspace\n\nWorking directory: `{}`\n",
+        conv_dir.display()
+    );
+
+    section.push_str(
+        "## Conversation Context\n\n\
+         The following files are specific to this conversation. \
+         They define your identity and behaviour for this chat only.\n\n",
+    );
+
+    let standard_files = [
+        "AGENTS.md",
+        "SOUL.md",
+        "TOOLS.md",
+        "IDENTITY.md",
+        "USER.md",
+        "MEMORY.md",
+    ];
+    for file in &standard_files {
+        let path = conv_dir.join(file);
+        if path.exists() {
+            inject_workspace_file(&mut section, conv_dir, file, max_chars);
+        }
+    }
+
+    // BOOTSTRAP.md only until generated — signals first-run state
+    let bootstrap = conv_dir.join("BOOTSTRAP.md");
+    if bootstrap.exists() {
+        inject_workspace_file(&mut section, conv_dir, "BOOTSTRAP.md", max_chars);
+    }
+
+    // Instruct the agent to scope memory tool calls to this conversation.
+    let _ = writeln!(
+        section,
+        "## Memory Scope\n\n\
+         This conversation has isolated memory. When calling `memory_store`, \
+         `memory_recall`, or `memory_observe` tools you **must** include \
+         `\"session_id\": \"{}\"` in the tool arguments so that memories are \
+         scoped to this conversation and do not bleed into other chats.",
+        reply_target
+    );
+
+    section
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
@@ -5753,6 +6100,50 @@ pub async fn start_channels(config: Config) -> Result<()> {
         } else {
             None
         },
+        per_conversation_workspace_channels: Arc::new({
+            let mut pcw_channels = Vec::new();
+            if config
+                .channels_config
+                .whatsapp
+                .as_ref()
+                .is_some_and(|w| w.per_conversation_workspace)
+            {
+                pcw_channels.push("whatsapp".to_string());
+            }
+            pcw_channels
+        }),
+        per_conversation_base_prompt: {
+            // Pre-build a tooling-only prompt (no workspace dir, no identity files)
+            // if any channel uses per-conversation workspaces.  Identity is injected
+            // per-message from the conversation workspace instead.
+            let has_pcw = config
+                .channels_config
+                .whatsapp
+                .as_ref()
+                .is_some_and(|w| w.per_conversation_workspace);
+            if has_pcw {
+                let mut base = build_system_prompt_tooling_only(
+                    &workspace,
+                    &model,
+                    &tool_descs,
+                    &skills,
+                    Some(&config.identity),
+                    bootstrap_max_chars,
+                    native_tools,
+                    config.skills.prompt_injection_mode,
+                );
+                if !native_tools {
+                    let filtered_specs =
+                        filtered_tool_specs_for_runtime(tools_registry.as_ref(), excluded);
+                    base.push_str(&build_tool_instructions_from_specs(&filtered_specs));
+                }
+                base.push_str(&build_shell_policy_instructions(&config.autonomy));
+                Some(Arc::new(base))
+            } else {
+                None
+            }
+        },
+        per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -6098,6 +6489,9 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6155,6 +6549,9 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6215,6 +6612,9 @@ mod tests {
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6898,6 +7298,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6985,6 +7388,9 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7059,6 +7465,9 @@ BTC is currently around $65,000 based on latest tool output."#
             hooks: None,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7147,6 +7556,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Vec::new(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7234,6 +7646,9 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Vec::new(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7306,6 +7721,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7380,6 +7798,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7456,6 +7877,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7563,6 +7987,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
         assert_eq!(
             runtime_ctx
@@ -7701,6 +8128,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7790,6 +8220,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7868,6 +8301,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let runtime_ctx_for_first_turn = runtime_ctx.clone();
@@ -8032,6 +8468,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
         assert_eq!(
             runtime_ctx
@@ -8147,6 +8586,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8257,6 +8699,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager,
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8349,6 +8794,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8451,6 +8899,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::clone(&approval_manager),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8554,6 +9005,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8705,6 +9159,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
             .await
@@ -8802,6 +9259,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8952,6 +9412,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9072,6 +9535,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9172,6 +9638,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9291,6 +9760,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: Arc::new(ApprovalManager::from_config(&autonomy_cfg)),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9411,6 +9883,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9490,6 +9965,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9597,6 +10075,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9784,6 +10265,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         maybe_apply_runtime_config_update(runtime_ctx.as_ref())
@@ -9941,6 +10425,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10009,6 +10496,9 @@ BTC is currently around $65,000 based on latest tool output."#
             approval_manager: mock_price_approved_manager(),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10191,6 +10681,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -10281,6 +10774,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -10383,6 +10879,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -10467,6 +10966,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -10536,6 +11038,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11167,6 +11672,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11263,6 +11771,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11358,6 +11869,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -11457,6 +11971,9 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -12285,6 +12802,9 @@ BTC is currently around $65,000 based on latest tool output."#;
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -12361,6 +12881,9 @@ BTC is currently around $65,000 based on latest tool output."#;
             )),
             safety_heartbeat: None,
             startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+            per_conversation_workspace_channels: Arc::new(Vec::new()),
+            per_conversation_base_prompt: None,
+            per_conversation_memory: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
