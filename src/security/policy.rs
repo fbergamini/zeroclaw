@@ -1327,9 +1327,26 @@ impl SecurityPolicy {
         // Expand "~" for consistent matching with forbidden paths and allowlists.
         let expanded_path = expand_user_path(path);
 
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
-            return false;
+        // For absolute paths, the workspace root (and any explicitly allowed root)
+        // takes precedence — mirroring the post-canonicalization logic in
+        // `is_resolved_path_allowed`. When an absolute path is provably inside the
+        // workspace we trust `is_resolved_path_allowed` to do the final symlink-safe
+        // check and skip the pre-check guard entirely.
+        if expanded_path.is_absolute() {
+            let in_workspace = expanded_path.starts_with(&self.workspace_dir);
+            let in_allowed_root = self.allowed_roots.iter().any(|r| expanded_path.starts_with(r));
+            if in_workspace || in_allowed_root {
+                // Path is within the workspace / allowed roots.  Allow it through
+                // here; the post-canonicalization `is_resolved_path_allowed` check
+                // still enforces symlink-safety and forbidden-path rules for the
+                // *resolved* path.
+                return true;
+            }
+            // Absolute path outside workspace: block when workspace_only is set,
+            // and let forbidden-path checks catch the rest.
+            if self.workspace_only {
+                return false;
+            }
         }
 
         // Block forbidden paths using path-component-aware matching
