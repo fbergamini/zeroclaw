@@ -86,6 +86,9 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
             || msg_lower.contains("invalid"))
+        // Pool exhaustion (e.g. Antigravity 503 "All accounts failed or unhealthy").
+        // Retrying won't help — skip directly to the next model in the fallback chain.
+        || is_pool_exhausted(err)
 }
 
 fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
@@ -116,6 +119,22 @@ fn is_rate_limited(err: &anyhow::Error) -> bool {
         && (msg.contains("Too Many") || msg.contains("rate") || msg.contains("limit"))
 }
 
+/// Check if an error indicates the upstream provider's account pool is fully
+/// exhausted (e.g. Antigravity 503 "All accounts failed or unhealthy").
+/// These are non-retryable: no amount of retrying will recover the pool within
+/// the backoff window, and the model should be put on a short cooldown.
+fn is_pool_exhausted(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    let pool_hints = [
+        "all accounts failed",
+        "all accounts exhausted",
+        "all accounts unhealthy",
+        "no healthy accounts",
+        "token error: all accounts",
+    ];
+    pool_hints.iter().any(|hint| msg.contains(hint))
+}
+
 /// Check if a 429 is a business/quota-plan error that retries cannot fix.
 ///
 /// Examples:
@@ -144,6 +163,11 @@ fn is_non_retryable_rate_limit(err: &anyhow::Error) -> bool {
         "package not active",
         "purchase package",
         "model not available for your plan",
+        // Antigravity Manager pool exhaustion — all pooled accounts are out
+        "all accounts exhausted",
+        // Google quota messages
+        "exhausted your capacity",
+        "you have exhausted",
     ];
 
     if business_hints.iter().any(|hint| lower.contains(hint)) {
@@ -337,12 +361,23 @@ impl ReliableProvider {
     /// `model` so that `model_chain` skips it until the quota window expires.
     /// Returns the retry_after_secs that was recorded, or None if not applicable.
     fn maybe_record_quota_cooldown(&self, model: &str, err: &anyhow::Error) -> Option<u64> {
-        if !is_non_retryable_rate_limit(err) {
+        // Lane 1: explicit quota-plan exhaustion (429 with business-level hints).
+        // Lane 2: upstream account pool exhaustion (any status, "all accounts failed").
+        //         Use a shorter default cooldown (5 min) since it's a pool issue,
+        //         not a billing quota window.
+        let (is_quota, default_secs) = if is_non_retryable_rate_limit(err) {
+            (true, 3600u64)
+        } else if is_pool_exhausted(err) {
+            (true, 300u64)
+        } else {
+            (false, 0)
+        };
+        if !is_quota {
             return None;
         }
         let retry_secs = parse_retry_after_ms(err)
             .map(|ms| ms.saturating_add(999) / 1000)
-            .unwrap_or(3600);
+            .unwrap_or(default_secs);
         let expires_at = Instant::now() + Duration::from_secs(retry_secs);
         if let Ok(mut cd) = self.quota_cooldowns.lock() {
             // Only insert (or extend) — never shorten an existing cooldown.

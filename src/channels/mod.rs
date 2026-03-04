@@ -4944,13 +4944,17 @@ fn ensure_conversation_workspace_initialized(
              This is a brand-new conversation on channel `{channel}` with `{reply_target}`.\n\
              Your per-conversation workspace for this chat lives at:\n\n\
              ```\n{conv_dir}\n```\n\n\
-             Use `file_write` to create the following files **inside that directory**:\n\
-             - `AGENTS.md` — agent rules / capabilities for this conversation\n\
-             - `SOUL.md`   — tone, values, and behavioural guardrails\n\
-             - `IDENTITY.md` — your persona name and emoji for this chat\n\
-             - `USER.md`   — everything you learn about this person/group\n\n\
-             Once you have gathered enough context through conversation, write those files.\n\
-             When they are all present, delete this BOOTSTRAP.md file.\n\n\
+             ⚠️ **Always use the full absolute path above when calling `file_write` or \
+             `file_edit`.** Relative paths will NOT land in this folder.\n\
+             Example: `{conv_dir}/IDENTITY.md`, NOT just `IDENTITY.md`.\n\n\
+             Use `file_write` to update the following files **using their full paths**:\n\
+             - `{conv_dir}/AGENTS.md` — agent rules / capabilities for this conversation\n\
+             - `{conv_dir}/SOUL.md`   — tone, values, and behavioural guardrails\n\
+             - `{conv_dir}/IDENTITY.md` — your persona name and emoji for this chat\n\
+             - `{conv_dir}/USER.md`   — everything you learn about this person/group\n\n\
+             Template versions of these files are already present in the workspace — \
+             update them in place rather than creating from scratch.\n\
+             Once they are all updated, delete this BOOTSTRAP.md file.\n\n\
              ---\n",
             channel = channel,
             reply_target = reply_target,
@@ -4973,6 +4977,39 @@ fn ensure_conversation_workspace_initialized(
                 tracing::warn!(err = %e, "Failed to create conversation BOOTSTRAP.md");
             }
         }
+
+        // Copy all other *.md template files from the main workspace into the
+        // new conversation workspace so the agent can update them in place
+        // rather than starting from scratch.  BOOTSTRAP.md is handled above.
+        if let Ok(entries) = std::fs::read_dir(main_workspace) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                    continue;
+                }
+                if path.file_name().and_then(|n| n.to_str()) == Some("BOOTSTRAP.md") {
+                    continue; // already handled with prepended header
+                }
+                let file_name = match path.file_name() {
+                    Some(n) => n,
+                    None => continue,
+                };
+                let target = conv_dir.join(file_name);
+                if let Err(e) = std::fs::copy(&path, &target) {
+                    tracing::warn!(
+                        src = %path.display(),
+                        dst = %target.display(),
+                        err = %e,
+                        "Failed to seed template MD file into conversation workspace"
+                    );
+                } else {
+                    tracing::debug!(
+                        file = %file_name.to_string_lossy(),
+                        "Seeded template MD file into conversation workspace"
+                    );
+                }
+            }
+        }
     }
     is_new
 }
@@ -4987,8 +5024,16 @@ fn build_conversation_context_section(conv_dir: &std::path::Path, reply_target: 
     let mut section = String::new();
     let _ = writeln!(
         section,
-        "## Workspace\n\nWorking directory: `{}`\n",
-        conv_dir.display()
+        "## Workspace\n\nConversation directory: `{dir}`\n\n\
+         ⚠️ File tools (`file_write`, `file_edit`, `file_read`) resolve relative \
+         paths against the **global** workspace root, not this directory.  \
+         Always pass the **full absolute path** for every file operation:\n\
+         - Identity files: `{dir}/USER.md`, `{dir}/IDENTITY.md`, etc.\n\
+         - Daily memory notes: `{dir}/memory/YYYY-MM-DD.md`\n\
+         - Long-term memory: `{dir}/MEMORY.md`\n\
+         - Heartbeat state: `{dir}/memory/heartbeat-state.json`\n\
+         Subdirectories (e.g. `{dir}/memory/`) are created automatically.\n",
+        dir = conv_dir.display()
     );
 
     section.push_str(
@@ -5012,10 +5057,49 @@ fn build_conversation_context_section(conv_dir: &std::path::Path, reply_target: 
         }
     }
 
-    // BOOTSTRAP.md only until generated — signals first-run state
+    // BOOTSTRAP.md: inject while setup is incomplete; auto-delete once the
+    // four core identity files have all been modified from their seeded templates
+    // (i.e. the agent has actually updated them).  We detect "modified" by
+    // comparing the conv file content against the main workspace template — if
+    // they differ the agent has personalised it.
+    // This handles the case where the agent lacks a file_delete tool.
     let bootstrap = conv_dir.join("BOOTSTRAP.md");
     if bootstrap.exists() {
-        inject_workspace_file(&mut section, conv_dir, "BOOTSTRAP.md", max_chars);
+        // Walk up from conv_dir to find the main workspace root
+        // (layout: <workspace>/conversations/<channel>/<jid>/)
+        let main_workspace = conv_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent());
+        let required_done = ["AGENTS.md", "SOUL.md", "IDENTITY.md", "USER.md"]
+            .iter()
+            .all(|f| {
+                let conv_file = conv_dir.join(f);
+                let conv_bytes = match std::fs::read(&conv_file) {
+                    Ok(b) => b,
+                    Err(_) => return false,
+                };
+                // If we can locate the template, require the content to differ.
+                if let Some(tmpl) = main_workspace.map(|w| w.join(f)) {
+                    if let Ok(tmpl_bytes) = std::fs::read(&tmpl) {
+                        return conv_bytes != tmpl_bytes;
+                    }
+                }
+                // No template to compare against — fall back to non-empty check.
+                !conv_bytes.is_empty()
+            });
+        if required_done {
+            if let Err(e) = std::fs::remove_file(&bootstrap) {
+                tracing::warn!(err = %e, "Failed to auto-delete BOOTSTRAP.md after setup");
+            } else {
+                tracing::info!(
+                    conv_dir = %conv_dir.display(),
+                    "BOOTSTRAP.md auto-deleted — all identity files updated from templates"
+                );
+            }
+        } else {
+            inject_workspace_file(&mut section, conv_dir, "BOOTSTRAP.md", max_chars);
+        }
     }
 
     // Instruct the agent to scope memory tool calls to this conversation.
