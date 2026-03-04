@@ -280,6 +280,11 @@ pub struct ReliableProvider {
     /// model_chain skips entries whose expires_at is still in the future, letting
     /// the next (cheaper) model handle the request until quota refreshes.
     quota_cooldowns: Arc<Mutex<HashMap<String, (Instant, u64)>>>,
+    /// The last fallback model that was notified to the user via MODEL_SWITCH_NOTIFIER.
+    /// `None` means the primary model is in use (no fallback active).
+    /// Updated whenever the active fallback model changes so that a second-level
+    /// fallback (e.g. claude → gemini-3-flash) also triggers a user notification.
+    current_fallback: Arc<Mutex<Option<String>>>,
 }
 
 impl ReliableProvider {
@@ -298,6 +303,7 @@ impl ReliableProvider {
             provider_model_fallbacks: HashMap::new(),
             vision_override: None,
             quota_cooldowns: Arc::new(Mutex::new(HashMap::new())),
+            current_fallback: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -473,7 +479,6 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let already_on_cooldown = self.quota_reset_secs(model).is_some();
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
@@ -482,17 +487,42 @@ impl Provider for ReliableProvider {
         // immediately. On non-retryable error, break to next provider. On
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
-            // Notify the channel layer when falling back to a lower-priority model
-            // due to quota exhaustion, so the user sees an in-chat status message.
-            if *current_model != model && !already_on_cooldown {
-                MODEL_SWITCH_NOTIFIER
-                    .try_with(|tx| {
-                        if let Some(tx) = tx.as_ref() {
-                            let _ = tx
-                                .send((model.to_string(), (*current_model).to_string(), self.quota_reset_secs(model)));
-                        }
-                    })
-                    .ok();
+            // Notify the channel layer when the active fallback model changes.
+            // Using current_fallback (rather than already_on_cooldown) ensures
+            // second-level switches (e.g. claude → gemini-3-flash) also trigger
+            // a notification, and repeat calls to the same fallback stay silent.
+            if *current_model == model {
+                // Visiting primary model — reset fallback tracking so any future
+                // fallback switch (from a new failure) triggers a fresh notification.
+                if let Ok(mut fb) = self.current_fallback.lock() {
+                    *fb = None;
+                }
+            } else {
+                let should_notify = {
+                    let mut fb = self
+                        .current_fallback
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if fb.as_deref() != Some(*current_model) {
+                        *fb = Some((*current_model).to_string());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_notify {
+                    MODEL_SWITCH_NOTIFIER
+                        .try_with(|tx| {
+                            if let Some(tx) = tx.as_ref() {
+                                let _ = tx.send((
+                                    model.to_string(),
+                                    (*current_model).to_string(),
+                                    self.quota_reset_secs(model),
+                                ));
+                            }
+                        })
+                        .ok();
+                }
             }
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
@@ -595,7 +625,7 @@ impl Provider for ReliableProvider {
                 }
             }
 
-            if *current_model != model && !already_on_cooldown {
+            if *current_model != model {
                 tracing::warn!(
                     original_model = model,
                     fallback_model = *current_model,
@@ -616,20 +646,40 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let already_on_cooldown = self.quota_reset_secs(model).is_some();
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
         for current_model in &models {
-            if *current_model != model && !already_on_cooldown {
-                MODEL_SWITCH_NOTIFIER
-                    .try_with(|tx| {
-                        if let Some(tx) = tx.as_ref() {
-                            let _ = tx
-                                .send((model.to_string(), (*current_model).to_string(), self.quota_reset_secs(model)));
-                        }
-                    })
-                    .ok();
+            if *current_model == model {
+                if let Ok(mut fb) = self.current_fallback.lock() {
+                    *fb = None;
+                }
+            } else {
+                let should_notify = {
+                    let mut fb = self
+                        .current_fallback
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if fb.as_deref() != Some(*current_model) {
+                        *fb = Some((*current_model).to_string());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_notify {
+                    MODEL_SWITCH_NOTIFIER
+                        .try_with(|tx| {
+                            if let Some(tx) = tx.as_ref() {
+                                let _ = tx.send((
+                                    model.to_string(),
+                                    (*current_model).to_string(),
+                                    self.quota_reset_secs(model),
+                                ));
+                            }
+                        })
+                        .ok();
+                }
             }
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
@@ -759,20 +809,40 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let already_on_cooldown = self.quota_reset_secs(model).is_some();
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
         for current_model in &models {
-            if *current_model != model && !already_on_cooldown {
-                MODEL_SWITCH_NOTIFIER
-                    .try_with(|tx| {
-                        if let Some(tx) = tx.as_ref() {
-                            let _ = tx
-                                .send((model.to_string(), (*current_model).to_string(), self.quota_reset_secs(model)));
-                        }
-                    })
-                    .ok();
+            if *current_model == model {
+                if let Ok(mut fb) = self.current_fallback.lock() {
+                    *fb = None;
+                }
+            } else {
+                let should_notify = {
+                    let mut fb = self
+                        .current_fallback
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if fb.as_deref() != Some(*current_model) {
+                        *fb = Some((*current_model).to_string());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_notify {
+                    MODEL_SWITCH_NOTIFIER
+                        .try_with(|tx| {
+                            if let Some(tx) = tx.as_ref() {
+                                let _ = tx.send((
+                                    model.to_string(),
+                                    (*current_model).to_string(),
+                                    self.quota_reset_secs(model),
+                                ));
+                            }
+                        })
+                        .ok();
+                }
             }
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
@@ -886,20 +956,40 @@ impl Provider for ReliableProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ChatResponse> {
-        let already_on_cooldown = self.quota_reset_secs(model).is_some();
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
         for current_model in &models {
-            if *current_model != model && !already_on_cooldown {
-                MODEL_SWITCH_NOTIFIER
-                    .try_with(|tx| {
-                        if let Some(tx) = tx.as_ref() {
-                            let _ = tx
-                                .send((model.to_string(), (*current_model).to_string(), self.quota_reset_secs(model)));
-                        }
-                    })
-                    .ok();
+            if *current_model == model {
+                if let Ok(mut fb) = self.current_fallback.lock() {
+                    *fb = None;
+                }
+            } else {
+                let should_notify = {
+                    let mut fb = self
+                        .current_fallback
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if fb.as_deref() != Some(*current_model) {
+                        *fb = Some((*current_model).to_string());
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if should_notify {
+                    MODEL_SWITCH_NOTIFIER
+                        .try_with(|tx| {
+                            if let Some(tx) = tx.as_ref() {
+                                let _ = tx.send((
+                                    model.to_string(),
+                                    (*current_model).to_string(),
+                                    self.quota_reset_secs(model),
+                                ));
+                            }
+                        })
+                        .ok();
+                }
             }
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
@@ -1001,7 +1091,7 @@ impl Provider for ReliableProvider {
                 }
             }
 
-            if *current_model != model && !already_on_cooldown {
+            if *current_model != model {
                 tracing::warn!(
                     original_model = model,
                     fallback_model = *current_model,
