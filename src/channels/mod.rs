@@ -3886,6 +3886,7 @@ or tune thresholds in config.",
                 let reply_tgt = msg.reply_target.clone();
                 let thread_ts_clone = msg.thread_ts.clone();
                 tokio::spawn(async move {
+                    let mut notified_refreshes = std::collections::HashSet::new();
                     while let Some((original, fallback, reset_secs)) = rx.recv().await {
                         // Format how long until the primary quota refreshes.
                         let eta = match reset_secs {
@@ -3917,23 +3918,28 @@ or tune thresholds in config.",
                         // Spawn a wakeup task: when quota refreshes, notify the
                         // chat and the next request will automatically try the
                         // better model again (cooldown is Instant-based).
+                        // Note: we only spawn ONE refresh notice per original model
+                        // per task scope to avoid spamming "Quota refreshed" multiple times.
                         if let Some(secs) = reset_secs {
-                            let ch2 = ch.clone();
-                            let reply_tgt2 = reply_tgt.clone();
-                            let thread_ts2 = thread_ts_clone.clone();
-                            let original2 = original.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_secs(secs)).await;
-                                let back_notice = format!(
-                                    "✅ Quota refreshed — switching back to `{original2}`."
-                                );
-                                let _ = ch2
-                                    .send(
-                                        &SendMessage::new(back_notice, &reply_tgt2)
-                                            .in_thread(thread_ts2),
-                                    )
-                                    .await;
-                            });
+                            if !notified_refreshes.contains(&original) {
+                                notified_refreshes.insert(original.clone());
+                                let ch2 = ch.clone();
+                                let reply_tgt2 = reply_tgt.clone();
+                                let thread_ts2 = thread_ts_clone.clone();
+                                let original2 = original.clone();
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                                    let back_notice = format!(
+                                        "✅ Quota refreshed — switching back to `{original2}`."
+                                    );
+                                    let _ = ch2
+                                        .send(
+                                            &SendMessage::new(back_notice, &reply_tgt2)
+                                                .in_thread(thread_ts2),
+                                        )
+                                        .await;
+                                });
+                            }
                         }
                     }
                 });

@@ -384,7 +384,10 @@ impl ReliableProvider {
         let retry_secs = parse_retry_after_ms(err)
             .map(|ms| ms.saturating_add(999) / 1000)
             .unwrap_or(default_secs);
-        let expires_at = Instant::now() + Duration::from_secs(retry_secs);
+        // Note: we add a 2-second buffer to the cooldown to ensure the
+        // "Quota refreshed" message (which is triggered when this cooldown ends)
+        // doesn't arrive before the upstream provider has actually reset.
+        let expires_at = Instant::now() + Duration::from_secs(retry_secs + 2);
         if let Ok(mut cd) = self.quota_cooldowns.lock() {
             // Only insert (or extend) — never shorten an existing cooldown.
             let entry = cd.entry(model.to_string()).or_insert((expires_at, retry_secs));
@@ -482,6 +485,8 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
+        let mut previous_model = model;
+
         // Outer: model fallback chain. Middle: provider priority. Inner: retries.
         // Each iteration: attempt one (provider, model) call. On success, return
         // immediately. On non-retryable error, break to next provider. On
@@ -515,7 +520,7 @@ impl Provider for ReliableProvider {
                         .try_with(|tx| {
                             if let Some(tx) = tx.as_ref() {
                                 let _ = tx.send((
-                                    model.to_string(),
+                                    previous_model.to_string(),
                                     (*current_model).to_string(),
                                     self.quota_reset_secs(model),
                                 ));
@@ -524,6 +529,7 @@ impl Provider for ReliableProvider {
                         .ok();
                 }
             }
+            previous_model = *current_model;
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
@@ -649,6 +655,8 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
+        let mut previous_model = model;
+
         for current_model in &models {
             if *current_model == model {
                 if let Ok(mut fb) = self.current_fallback.lock() {
@@ -672,7 +680,7 @@ impl Provider for ReliableProvider {
                         .try_with(|tx| {
                             if let Some(tx) = tx.as_ref() {
                                 let _ = tx.send((
-                                    model.to_string(),
+                                    previous_model.to_string(),
                                     (*current_model).to_string(),
                                     self.quota_reset_secs(model),
                                 ));
@@ -681,6 +689,7 @@ impl Provider for ReliableProvider {
                         .ok();
                 }
             }
+            previous_model = *current_model;
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
@@ -812,6 +821,8 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
+        let mut previous_model = model;
+
         for current_model in &models {
             if *current_model == model {
                 if let Ok(mut fb) = self.current_fallback.lock() {
@@ -835,7 +846,7 @@ impl Provider for ReliableProvider {
                         .try_with(|tx| {
                             if let Some(tx) = tx.as_ref() {
                                 let _ = tx.send((
-                                    model.to_string(),
+                                    previous_model.to_string(),
                                     (*current_model).to_string(),
                                     self.quota_reset_secs(model),
                                 ));
@@ -844,6 +855,7 @@ impl Provider for ReliableProvider {
                         .ok();
                 }
             }
+            previous_model = *current_model;
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
@@ -959,6 +971,8 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
+        let mut previous_model = model;
+
         for current_model in &models {
             if *current_model == model {
                 if let Ok(mut fb) = self.current_fallback.lock() {
@@ -982,7 +996,7 @@ impl Provider for ReliableProvider {
                         .try_with(|tx| {
                             if let Some(tx) = tx.as_ref() {
                                 let _ = tx.send((
-                                    model.to_string(),
+                                    previous_model.to_string(),
                                     (*current_model).to_string(),
                                     self.quota_reset_secs(model),
                                 ));
@@ -991,6 +1005,7 @@ impl Provider for ReliableProvider {
                         .ok();
                 }
             }
+            previous_model = *current_model;
             for (provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
                 let sent_models =
                     self.provider_model_chain(current_model, provider_name, provider_index == 0);
