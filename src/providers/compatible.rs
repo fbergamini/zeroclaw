@@ -1463,7 +1463,7 @@ impl OpenAiCompatibleProvider {
             AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
             AuthStyle::XApiKey => req.header("x-api-key", credential),
             AuthStyle::Custom(header) => {
-                if header == "Authorization" {
+                if header == "Authorization" || header == "VERCEL_OIDC_TOKEN" {
                     req.header(header, format!("Bearer {credential}"))
                 } else {
                     req.header(header, credential)
