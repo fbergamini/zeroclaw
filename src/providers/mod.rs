@@ -1206,7 +1206,7 @@ fn create_provider_with_url_and_options(
             "Vercel AI Gateway",
             VERCEL_AI_GATEWAY_BASE_URL,
             key,
-            AuthStyle::Custom("VERCEL_OIDC_TOKEN".to_string()),
+            AuthStyle::Custom("Authorization".to_string()),
         ))),
         "cloudflare" | "cloudflare-ai" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Cloudflare AI Gateway",

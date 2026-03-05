@@ -1462,7 +1462,13 @@ impl OpenAiCompatibleProvider {
         match &self.auth_header {
             AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
             AuthStyle::XApiKey => req.header("x-api-key", credential),
-            AuthStyle::Custom(header) => req.header(header, credential),
+            AuthStyle::Custom(header) => {
+                if header == "Authorization" {
+                    req.header(header, format!("Bearer {credential}"))
+                } else {
+                    req.header(header, credential)
+                }
+            }
         }
     }
 
